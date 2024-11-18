@@ -2,10 +2,11 @@ package io.joern.rubysrc2cpg.astcreation
 
 import io.joern.rubysrc2cpg.astcreation.RubyIntermediateAst.{RubyStatement, *}
 import io.joern.rubysrc2cpg.datastructures.BlockScope
+import io.joern.rubysrc2cpg.parser.RubyJsonHelpers
 import io.joern.rubysrc2cpg.passes.Defines
 import io.joern.rubysrc2cpg.passes.Defines.getBuiltInType
 import io.joern.x2cpg.{Ast, ValidationMode}
-import io.shiftleft.codepropertygraph.generated.nodes.NewControlStructure
+import io.shiftleft.codepropertygraph.generated.nodes.{NewBlock, NewControlStructure}
 import io.shiftleft.codepropertygraph.generated.{ControlStructureTypes, ModifierTypes}
 
 trait AstForStatementsCreator(implicit withSchemaValidation: ValidationMode) { this: AstCreator =>
@@ -14,6 +15,7 @@ trait AstForStatementsCreator(implicit withSchemaValidation: ValidationMode) { t
     baseAstCache.clear() // A safe approximation on where to reset the cache
     node match {
       case node: IfExpression               => astForIfStatement(node)
+      case node: OperatorAssignment         => astForOperatorAssignment(node)
       case node: CaseExpression             => astsForCaseExpression(node)
       case node: StatementList              => astForStatementList(node) :: Nil
       case node: ReturnExpression           => astForReturnExpression(node) :: Nil
@@ -22,6 +24,7 @@ trait AstForStatementsCreator(implicit withSchemaValidation: ValidationMode) { t
       case node: FieldsDeclaration          => astsForFieldDeclarations(node)
       case node: AccessModifier             => registerAccessModifier(node)
       case node: MethodDeclaration          => astForMethodDeclaration(node)
+      case node: MethodAccessModifier       => astForMethodAccessModifier(node)
       case node: SingletonMethodDeclaration => astForSingletonMethodDeclaration(node)
       case node: MultipleAssignment         => node.assignments.map(astForExpression)
       case node: BreakExpression            => astForBreakExpression(node) :: Nil
@@ -36,7 +39,38 @@ trait AstForStatementsCreator(implicit withSchemaValidation: ValidationMode) { t
       controlStructureAst(ifNode, Some(conditionAst), thenAst :: elseAsts)
     }
 
-    foldIfExpression(builder)(node) :: Nil
+    // TODO: Remove or modify the builder pattern when we are no longer using ANTLR
+    node.elseClause match {
+      case Some(elseClause) =>
+        elseClause match {
+          case _: IfExpression => astForJsonIfStatement(node)
+          case _               => foldIfExpression(builder)(node) :: Nil
+        }
+      case None =>
+        foldIfExpression(builder)(node) :: Nil
+    }
+  }
+
+  private def astForOperatorAssignment(node: OperatorAssignment): Seq[Ast] = {
+    val loweredAssignment = lowerAssignmentOperator(node.lhs, node.rhs, node.op, node.span)
+    astsForStatement(loweredAssignment)
+  }
+
+  private def astForJsonIfStatement(node: IfExpression): Seq[Ast] = {
+    val conditionAst = astForExpression(node.condition)
+    val thenAst      = astForThenClause(node.thenClause)
+    val elseAsts = node.elseClause
+      .map {
+        case x: IfExpression =>
+          val wrappedBlock = blockNode(x)
+          Ast(wrappedBlock).withChildren(astForJsonIfStatement(x)) :: Nil
+        case x =>
+          astForElseClause(x) :: Nil
+      }
+      .getOrElse(Ast() :: Nil)
+
+    val ifNode = controlStructureNode(node, ControlStructureTypes.IF, code(node))
+    controlStructureAst(ifNode, Some(conditionAst), thenAst +: elseAsts) :: Nil
   }
 
   /** Registers the currently set access modifier for the current type (until it is reset later).
@@ -61,7 +95,7 @@ trait AstForStatementsCreator(implicit withSchemaValidation: ValidationMode) { t
     builder(node, conditionAst, thenAst, elseAsts)
   }
 
-  private def astForThenClause(node: RubyExpression): Ast = astForStatementList(node.asStatementList)
+  protected def astForThenClause(node: RubyExpression): Ast = astForStatementList(node.asStatementList)
 
   private def astsForElseClauses(
     elsIfClauses: List[RubyExpression],
@@ -151,7 +185,14 @@ trait AstForStatementsCreator(implicit withSchemaValidation: ValidationMode) { t
       case expr: ControlFlowStatement =>
         def transform(e: RubyExpression & ControlFlowStatement): RubyExpression =
           transformLastRubyNodeInControlFlowExpressionBody(e, returnLastNode(_, transform), elseReturnNil)
-        astsForStatement(transform(expr))
+
+        expr match {
+          case x @ OperatorAssignment(lhs, op, rhs) =>
+            val loweredAssignment = lowerAssignmentOperator(lhs, rhs, op, x.span)
+            astsForStatement(transform(loweredAssignment))
+          case x =>
+            astsForStatement(transform(expr))
+        }
       case node: MemberCallWithBlock => returnAstForRubyCall(node)
       case node: SimpleCallWithBlock => returnAstForRubyCall(node)
       case _: (LiteralExpr | BinaryExpression | UnaryExpression | SimpleIdentifier | SelfIdentifier | IndexAccess |
@@ -175,10 +216,16 @@ trait AstForStatementsCreator(implicit withSchemaValidation: ValidationMode) { t
       case ret: ReturnExpression => astForReturnExpression(ret) :: Nil
       case node: (MethodDeclaration | SingletonMethodDeclaration) =>
         (astsForStatement(node) :+ astForReturnMethodDeclarationSymbolName(node)).toList
+      case stmtList: StatementList if stmtList.statements.lastOption.exists(_.isInstanceOf[ReturnExpression]) =>
+        stmtList.statements.map(astForExpression)
+      case StatementList(stmts) =>
+        val nilReturnSpan    = node.span.spanStart("return nil")
+        val nilReturnLiteral = StaticLiteral(Defines.NilClass)(nilReturnSpan)
+        stmts.map(astForExpression) ++ astsForImplicitReturnStatement(nilReturnLiteral)
+      case x: RangeExpression =>
+        astForReturnRangeExpression(x) :: Nil
       case node =>
-        logger.warn(
-          s"Implicit return here not supported yet: ${node.text} (${node.getClass.getSimpleName}), only generating statement"
-        )
+        logger.warn(s" not supported yet: ${node.text} (${node.getClass.getSimpleName}), only generating statement")
         astsForStatement(node).toList
   }
 
@@ -197,6 +244,10 @@ trait AstForStatementsCreator(implicit withSchemaValidation: ValidationMode) { t
     val literalNode_ = literalNode(node, s":${node.methodName}", getBuiltInType(Defines.Symbol))
     val returnNode_  = returnNode(node, literalNode_.code)
     returnAst(returnNode_, Seq(Ast(literalNode_)))
+  }
+
+  private def astForReturnRangeExpression(node: RangeExpression): Ast = {
+    returnAst(returnNode(node, code(node)), List(astForRange(node)))
   }
 
   private def astForReturnMemberCall(node: MemberAccess): Ast = {
@@ -279,6 +330,9 @@ trait AstForStatementsCreator(implicit withSchemaValidation: ValidationMode) { t
       case WhileExpression(condition, body)   => WhileExpression(condition, transform(body))(node.span)
       case DoWhileExpression(condition, body) => DoWhileExpression(condition, transform(body))(node.span)
       case UntilExpression(condition, body)   => UntilExpression(condition, transform(body))(node.span)
+      case OperatorAssignment(lhs, op, rhs) =>
+        val loweredNode = lowerAssignmentOperator(lhs, rhs, op, node.span)
+        transformLastRubyNodeInControlFlowExpressionBody(loweredNode, transform, defaultElseBranch)
       case IfExpression(condition, thenClause, elsifClauses, elseClause) =>
         IfExpression(
           condition,

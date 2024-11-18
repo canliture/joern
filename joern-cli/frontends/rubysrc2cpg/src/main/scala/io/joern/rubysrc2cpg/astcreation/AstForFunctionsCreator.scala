@@ -67,7 +67,7 @@ trait AstForFunctionsCreator(implicit withSchemaValidation: ValidationMode) { th
     )
 
     val isSurroundedByProgramScope = scope.isSurroundedByProgramScope
-    if (isConstructor) scope.pushNewScope(ConstructorScope(fullName))
+    if (isConstructor) scope.pushNewScope(ConstructorScope(fullName, this.procParamGen.fresh))
     else scope.pushNewScope(MethodScope(fullName, this.procParamGen.fresh))
 
     val thisParameterNode = newThisParameterNode(
@@ -178,6 +178,25 @@ trait AstForFunctionsCreator(implicit withSchemaValidation: ValidationMode) { th
     // In the case of a closure, we expect this method to return a method ref, otherwise, we bind a pointer to a
     // method ref, e.g. self.foo = def foo(...)
     if isClosure || isSingletonObjectMethod then refs else createMethodRefPointer(method) :: Nil
+  }
+
+  protected def astForMethodAccessModifier(node: MethodAccessModifier): Seq[Ast] = {
+    val originalAccessModifier = currentAccessModifier
+    popAccessModifier()
+
+    node match {
+      case _: PrivateMethodModifier =>
+        pushAccessModifier(ModifierTypes.PRIVATE)
+      case _: PublicMethodModifier =>
+        pushAccessModifier(ModifierTypes.PUBLIC)
+    }
+
+    val methodAst = astsForStatement(node.method)
+
+    popAccessModifier()
+    pushAccessModifier(originalAccessModifier)
+
+    methodAst
   }
 
   private def transformAsClosureBody(refs: List[Ast], baseStmtBlockAst: Ast) = {
@@ -440,7 +459,7 @@ trait AstForFunctionsCreator(implicit withSchemaValidation: ValidationMode) { th
             parameterAsts ++ anonProcParam,
             stmtBlockAst,
             methodReturnNode(node, Defines.Any),
-            newModifierNode(ModifierTypes.VIRTUAL) :: Nil
+            newModifierNode(ModifierTypes.VIRTUAL) :: newModifierNode(currentAccessModifier) :: Nil
           )
 
         _methodAst :: methodTypeDeclAst :: Nil foreach (Ast.storeInDiffGraph(_, diffGraph))

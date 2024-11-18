@@ -1,10 +1,10 @@
 package io.joern.rubysrc2cpg.querying
 
-import io.joern.rubysrc2cpg.passes.Defines
+import io.joern.rubysrc2cpg.passes.{Defines, GlobalTypes}
 import io.joern.rubysrc2cpg.passes.Defines.Main
 import io.joern.rubysrc2cpg.testfixtures.RubyCode2CpgFixture
-import io.shiftleft.codepropertygraph.generated.NodeTypes
-import io.shiftleft.codepropertygraph.generated.nodes.{File, NamespaceBlock}
+import io.shiftleft.codepropertygraph.generated.{ModifierTypes, NodeTypes}
+import io.shiftleft.codepropertygraph.generated.nodes.{File, Literal, NamespaceBlock}
 import io.shiftleft.semanticcpg.language.*
 
 class ModuleTests extends RubyCode2CpgFixture {
@@ -75,6 +75,97 @@ class ModuleTests extends RubyCode2CpgFixture {
         parentFileDecl.name shouldBe "Test0.rb"
 
       case xs => fail(s"Expected one class decl, got [${xs.code.mkString(",")}]")
+    }
+  }
+
+  "Class Method Modifiers" should {
+    val cpg = code("""
+        |# Taken from Mastodon Repo
+        |module LanguagesHelper
+        |  ISO_639_1 = {}
+        |  ISO_639_3 = {}
+        |  SUPPORTED_LOCALES = {}
+        |  REGIONAL_LOCALE_NAMES = {}
+        |
+        |  private_class_method def self.locale_name_for_sorting(locale)
+        |    if (supported_locale = SUPPORTED_LOCALES[locale.to_sym])
+        |      ASCIIFolding.new.fold(supported_locale[1]).downcase
+        |    elsif (regional_locale = REGIONAL_LOCALE_NAMES[locale.to_sym])
+        |      ASCIIFolding.new.fold(regional_locale).downcase
+        |    else
+        |      locale
+        |    end
+        |  end
+        |
+        |  def publicMethodAfterwards
+        |  end
+        |end
+        |""".stripMargin)
+    "Generate private modifier on method" in {
+      inside(cpg.method.name("locale_name_for_sorting")._modifierViaAstOut.l) {
+        case virtualModifier :: privateModifier :: Nil =>
+          virtualModifier.modifierType shouldBe ModifierTypes.VIRTUAL
+          privateModifier.modifierType shouldBe ModifierTypes.PRIVATE
+        case xs => fail(s"Expected two modifiers, got [${xs.modifierType.mkString(",")}]")
+      }
+    }
+
+    "Revert to original access modifier after previous method def" in {
+      inside(cpg.method.name("publicMethodAfterwards")._modifierViaAstOut.l) {
+        case virtualModifier :: publicModifier :: Nil =>
+          virtualModifier.modifierType shouldBe ModifierTypes.VIRTUAL
+          publicModifier.modifierType shouldBe ModifierTypes.PUBLIC
+        case xs => fail(s"Expected got [${xs.modifierType.mkString(",")}]")
+      }
+    }
+  }
+
+  "Protected call with block" should {
+    val cpg = code("""
+        |module QA
+        |  trait :protected do
+        |    protected { true }
+        |  end
+        |end
+        |""".stripMargin)
+
+    "Have the correct proc arg in call" in {
+      inside(cpg.call.name("protected").argument.l) {
+        case _ :: proc :: Nil =>
+          proc.code shouldBe "<lambda>1&Proc"
+        case xs => fail(s"Expected one call for protected, got [${xs.code.mkString(",")}]")
+      }
+    }
+
+    "Generate a lambda with true body" in {
+      inside(cpg.method.isLambda.l) {
+        case protectedLambda :: _ :: Nil =>
+          val List(lambdaReturn) = protectedLambda.body.astChildren.isReturn.l
+          lambdaReturn.code shouldBe "true"
+        case xs => fail(s"Expected two lambdas, got [${xs.code.mkString(",")}]")
+      }
+    }
+  }
+  "Argument `(...)` in call should not be lifted" in {
+    val cpg = code("""
+        |module ArticlesHelper
+        |  def foo
+        |  end
+        |
+        |  def active_threads(...)
+        |    Articles::ActiveThreadsQuery.call(...)
+        |  end
+        |end
+        |
+        |""".stripMargin)
+
+    inside(cpg.typeDecl.name("ArticlesHelper").method.l) {
+      case bodyMethod :: _ :: _ :: Nil =>
+        inside(bodyMethod.block.astChildren.l) {
+          case Nil => // bodyMethod should be empty
+          case xs  => fail(s"Expected empty body, got [${xs.code.mkString(",")}]")
+        }
+      case xs => fail(s"Expected three methods got [${xs.name.mkString(",")}]")
     }
   }
 }

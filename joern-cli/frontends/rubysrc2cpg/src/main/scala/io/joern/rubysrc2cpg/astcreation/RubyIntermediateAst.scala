@@ -135,12 +135,13 @@ object RubyIntermediateAst {
       extends RubyExpression(span)
       with AnonymousTypeDeclaration
 
-  final case class FieldsDeclaration(fieldNames: List[RubyExpression])(span: TextSpan)
+  final case class FieldsDeclaration(fieldNames: List[RubyExpression], accessType: String)(span: TextSpan)
       extends RubyExpression(span)
       with AllowedTypeDeclarationChild {
     def hasGetter: Boolean = text.startsWith("attr_reader") || text.startsWith("attr_accessor")
-
     def hasSetter: Boolean = text.startsWith("attr_writer") || text.startsWith("attr_accessor")
+
+    def isSplattingFieldDecl: Boolean = fieldNames.length == 1 && fieldNames.head.isInstanceOf[SplattingRubyNode]
   }
 
   sealed trait ProcedureDeclaration extends RubyStatement {
@@ -178,7 +179,9 @@ object RubyIntermediateAst {
     def name: String
   }
 
-  final case class MandatoryParameter(name: String)(span: TextSpan) extends RubyExpression(span) with MethodParameter
+  final case class MandatoryParameter(name: String)(span: TextSpan) extends RubyExpression(span) with MethodParameter {
+    def toSimpleIdentifier: SimpleIdentifier = SimpleIdentifier()(span)
+  }
 
   final case class OptionalParameter(name: String, defaultExpression: RubyExpression)(span: TextSpan)
       extends RubyExpression(span)
@@ -207,6 +210,11 @@ object RubyIntermediateAst {
   trait MultipleAssignment extends RubyStatement {
     def assignments: List[SingleAssignment]
   }
+
+  final case class OperatorAssignment(lhs: RubyExpression, op: String, rhs: RubyExpression)(span: TextSpan)
+      extends RubyExpression(span)
+      with RubyStatement
+      with ControlFlowStatement
 
   final case class DefaultMultipleAssignment(assignments: List[SingleAssignment])(span: TextSpan)
       extends RubyExpression(span)
@@ -237,11 +245,17 @@ object RubyIntermediateAst {
 
   /** Any structure that is an Identifier, except self. e.g. `a`, `@a`, `@@a`
     */
-  sealed trait RubyIdentifier
+  sealed trait RubyIdentifier extends RubyExpression {
+    override def toString: String = span.text
+  }
 
   /** Ruby Instance or Class Variable Identifiers: `@a`, `@@a`
     */
-  sealed trait RubyFieldIdentifier extends RubyIdentifier
+  sealed trait RubyFieldIdentifier extends RubyIdentifier {
+    def toMemberAccess: MemberAccess = {
+      MemberAccess(SelfIdentifier()(span), ".", span.text)(span)
+    }
+  }
 
   sealed trait SingletonMethodIdentifier
 
@@ -411,19 +425,27 @@ object RubyIntermediateAst {
     def typeFullName: String = Defines.getBuiltInType(Defines.Array)
   }
 
-  final case class HashLiteral(elements: List[RubyExpression])(span: TextSpan)
-      extends RubyExpression(span)
-      with LiteralExpr {
+  sealed trait HashLike extends RubyExpression with LiteralExpr {
+    def elements: List[RubyExpression]
     def typeFullName: String = Defines.getBuiltInType(Defines.Hash)
   }
 
+  final case class HashLiteral(elements: List[RubyExpression])(span: TextSpan)
+      extends RubyExpression(span)
+      with HashLike
+
   final case class Association(key: RubyExpression, value: RubyExpression)(span: TextSpan) extends RubyExpression(span)
+
+  final case class AssociationList(elements: List[RubyExpression])(span: TextSpan)
+      extends RubyExpression(span)
+      with HashLike
 
   /** Represents a call.
     */
-  sealed trait RubyCall {
+  sealed trait RubyCall extends RubyExpression {
     def target: RubyExpression
     def arguments: List[RubyExpression]
+    def withBlock(block: Block): RubyCallWithBlock[?] = SimpleCallWithBlock(target, arguments, block)(span)
   }
 
   /** Represents traditional calls, e.g. `foo`, `foo x, y`, `foo(x,y)` */
@@ -458,6 +480,10 @@ object RubyIntermediateAst {
     def toSimpleIdentifier: SimpleIdentifier
   }
 
+  sealed trait MethodAccessModifier extends AllowedTypeDeclarationChild {
+    def method: RubyExpression
+  }
+
   final case class PublicModifier()(span: TextSpan) extends RubyExpression(span) with AccessModifier {
     override def toSimpleIdentifier: SimpleIdentifier = SimpleIdentifier(None)(span)
   }
@@ -469,6 +495,14 @@ object RubyIntermediateAst {
   final case class ProtectedModifier()(span: TextSpan) extends RubyExpression(span) with AccessModifier {
     override def toSimpleIdentifier: SimpleIdentifier = SimpleIdentifier(None)(span)
   }
+
+  final case class PrivateMethodModifier(method: RubyExpression)(span: TextSpan)
+      extends RubyExpression(span)
+      with MethodAccessModifier
+
+  final case class PublicMethodModifier(method: RubyExpression)(span: TextSpan)
+      extends RubyExpression(span)
+      with MethodAccessModifier
 
   /** Represents standalone `proc { ... }` or `lambda { ... }` expressions
     */
@@ -496,7 +530,10 @@ object RubyIntermediateAst {
   final case class MemberCall(target: RubyExpression, op: String, methodName: String, arguments: List[RubyExpression])(
     span: TextSpan
   ) extends RubyExpression(span)
-      with RubyCall
+      with RubyCall {
+    override def withBlock(block: Block): RubyCallWithBlock[?] =
+      MemberCallWithBlock(target, op, methodName, arguments, block)(span)
+  }
 
   /** Special class for `<body>` calls of type decls.
     */
@@ -529,7 +566,7 @@ object RubyIntermediateAst {
 
   final case class MemberAccess(target: RubyExpression, op: String, memberName: String)(span: TextSpan)
       extends RubyExpression(span) {
-    override def toString: String = s"${target.text}.$memberName"
+    override def toString: String = s"${target.text}${op}$memberName"
   }
 
   /** A Ruby node that instantiates objects.
@@ -538,7 +575,10 @@ object RubyIntermediateAst {
 
   final case class SimpleObjectInstantiation(target: RubyExpression, arguments: List[RubyExpression])(span: TextSpan)
       extends RubyExpression(span)
-      with ObjectInstantiation
+      with ObjectInstantiation {
+    override def withBlock(block: Block): RubyCallWithBlock[SimpleObjectInstantiation] =
+      ObjectInstantiationWithBlock(target, arguments, block)(span)
+  }
 
   final case class ObjectInstantiationWithBlock(target: RubyExpression, arguments: List[RubyExpression], block: Block)(
     span: TextSpan
@@ -552,6 +592,8 @@ object RubyIntermediateAst {
   final case class Block(parameters: List[RubyExpression], body: RubyExpression)(span: TextSpan)
       extends RubyExpression(span)
       with RubyStatement {
+
+    def toStatementList: StatementList = StatementList(body :: Nil)(span)
 
     def toMethodDeclaration(name: String, parameters: Option[List[RubyExpression]]): MethodDeclaration =
       parameters match {

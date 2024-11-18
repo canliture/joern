@@ -1,7 +1,7 @@
 package io.joern.rubysrc2cpg.querying
 
+import io.joern.rubysrc2cpg.passes.Defines.{Initialize, Main, RubyOperators}
 import io.joern.rubysrc2cpg.passes.GlobalTypes.builtinPrefix
-import io.joern.rubysrc2cpg.passes.Defines.{Initialize, Main}
 import io.joern.rubysrc2cpg.testfixtures.RubyCode2CpgFixture
 import io.joern.x2cpg.Defines
 import io.shiftleft.codepropertygraph.generated.Operators
@@ -285,7 +285,8 @@ class DoBlockTests extends RubyCode2CpgFixture {
                 s"Expected four nodes under the lowering block of a constructor, instead got [${xs.code.mkString(",")}]"
               )
           }
-        case xs => fail(s"Unexpected `foo` assignment children [${xs.code.mkString(",")}]")
+        case xs =>
+          fail(s"Unexpected `foo` assignment children [${xs.code.mkString(",")}]")
       }
     }
   }
@@ -339,7 +340,7 @@ class DoBlockTests extends RubyCode2CpgFixture {
     "create a lambda method with a `y` parameter" in {
       inside(cpg.method.isLambda.headOption) {
         case Some(lambda) =>
-          lambda.code shouldBe "{ y }"
+          lambda.code shouldBe "->(y) { y }"
           lambda.parameter.name.l shouldBe List("self", "y")
         case xs => fail(s"Expected a lambda method")
       }
@@ -365,7 +366,7 @@ class DoBlockTests extends RubyCode2CpgFixture {
     "create a lambda method with a `y` parameter" in {
       inside(cpg.method.isLambda.headOption) {
         case Some(lambda) =>
-          lambda.code shouldBe "{ |y| y }"
+          lambda.code shouldBe "lambda { |y| y }"
           lambda.parameter.name.l shouldBe List("self", "y")
         case xs => fail(s"Expected a lambda method")
       }
@@ -387,6 +388,7 @@ class DoBlockTests extends RubyCode2CpgFixture {
                      | def get_pto_schedule
                      |    begin
                      |       jfs = []
+                     |       schedules = []
                      |       schedules.each do |s|
                      |          hash = Hash.new
                      |          hash[:id] = s[:id]
@@ -401,14 +403,13 @@ class DoBlockTests extends RubyCode2CpgFixture {
                      |""".stripMargin)
 
     inside(cpg.local.l) {
-      case jfsOutsideLocal :: hashInsideLocal :: tmp0 :: jfsCapturedLocal :: tmp1 :: Nil =>
+      case jfsOutsideLocal :: schedules :: hashInsideLocal :: tmp0 :: jfsCapturedLocal :: Nil =>
         jfsOutsideLocal.closureBindingId shouldBe None
         hashInsideLocal.closureBindingId shouldBe None
         jfsCapturedLocal.closureBindingId shouldBe Some("Test0.rb:<main>.get_pto_schedule.jfs")
 
         tmp0.name shouldBe "<tmp-0>"
-        tmp1.name shouldBe "<tmp-1>"
-      case xs => fail(s"Expected 5 locals, got ${xs.code.mkString(",")}")
+      case xs => fail(s"Expected 6 locals, got ${xs.code.mkString(",")}")
     }
 
     inside(cpg.method.isLambda.local.l) {
@@ -421,7 +422,9 @@ class DoBlockTests extends RubyCode2CpgFixture {
 
   "Various do-block parameters" should {
     val cpg = code("""
-        |f { |a, (b, c), *d, e, (f, *g), **h, &i| }
+        |f { |a, (b, c), *d, e, (f, *g), **h, &i|
+        | puts a
+        |}
         |""".stripMargin)
 
     "Generate correct parameters" in {
@@ -478,6 +481,52 @@ class DoBlockTests extends RubyCode2CpgFixture {
     "Return nil and not the desugaring" in {
       val nilLiteral = cpg.method.isLambda.methodReturn.toReturn.astChildren.isLiteral.head
       nilLiteral.code shouldBe "return nil"
+    }
+  }
+
+  "Nested grouped parameter in block" in {
+    val cpg = code("""
+        |def format_result(result)
+        |  result.each_with_object({}) do |((label_id, date), count), hash|
+        |    label = labels_by_id.fetch(label_id)
+        |  end.values
+        |end
+        |""".stripMargin)
+
+    inside(cpg.method.isLambda.body.astChildren.isCall.name(Operators.assignment).l) {
+      case _ :: groupedParam :: countAssignment :: Nil =>
+        inside(groupedParam.argument.l) {
+          case (labelIdAssign: Call) :: (dateAssign: Call) :: (tmp0Splat: Call) :: Nil =>
+            inside(labelIdAssign.argument.l) {
+              case (lhs: Identifier) :: (rhs: Call) :: Nil =>
+                lhs.code shouldBe "label_id"
+
+                rhs.code shouldBe "*<tmp-1>"
+                rhs.methodFullName shouldBe RubyOperators.splat
+              case xs =>
+                fail(s"Expected lhs and rhs for assignment, got ${xs.code.mkString(",")}")
+            }
+
+            inside(dateAssign.argument.l) {
+              case (lhs: Identifier) :: (rhs: Call) :: Nil =>
+                lhs.code shouldBe "date"
+
+                rhs.code shouldBe "*<tmp-1>"
+                rhs.methodFullName shouldBe RubyOperators.splat
+              case xs =>
+                fail(s"Expected lhs and rhs for assignment, got ${xs.code.mkString(",")}")
+            }
+          case xs => fail(s"Expected four arguments for call, got [${xs.code.mkString(",")}]")
+        }
+
+        inside(countAssignment.argument.l) {
+          case (lhs: Identifier) :: (rhs: Call) :: Nil =>
+            lhs.code shouldBe "count"
+            rhs.code shouldBe "*<tmp-0>"
+            rhs.methodFullName shouldBe RubyOperators.splat
+          case xs => fail(s"Expected LHS and RHS for assignment, got ${xs.code.mkString(",")}")
+        }
+      case xs => fail(s"Expected three assignment calls, got [${xs.code.mkString(",")}]")
     }
   }
 }

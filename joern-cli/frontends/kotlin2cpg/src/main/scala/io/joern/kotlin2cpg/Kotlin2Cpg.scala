@@ -4,10 +4,10 @@ import better.files.File
 import io.joern.kotlin2cpg.compiler.CompilerAPI
 import io.joern.kotlin2cpg.compiler.ErrorLoggingMessageCollector
 import io.joern.kotlin2cpg.files.SourceFilesPicker
-import io.joern.kotlin2cpg.interop.JavasrcInterop
+import io.joern.kotlin2cpg.interop.JavaSrcInterop
 import io.joern.kotlin2cpg.jar4import.UsesService
 import io.joern.kotlin2cpg.passes.*
-import io.joern.kotlin2cpg.types.{ContentSourcesPicker, DefaultTypeInfoProvider}
+import io.joern.kotlin2cpg.types.{ContentSourcesPicker, TypeInfoProvider}
 import io.joern.x2cpg.SourceFiles
 import io.joern.x2cpg.X2CpgFrontend
 import io.joern.x2cpg.X2Cpg.withNewEmptyCpg
@@ -21,6 +21,7 @@ import io.shiftleft.codepropertygraph.generated.Cpg
 import io.shiftleft.codepropertygraph.generated.Languages
 import io.shiftleft.utils.IOUtils
 import org.jetbrains.kotlin.cli.jvm.compiler.{KotlinCoreEnvironment, KotlinToJVMBytecodeCompiler}
+import org.jetbrains.kotlin.com.intellij.openapi.util.Disposer
 import org.jetbrains.kotlin.psi.KtFile
 import org.jetbrains.kotlin.resolve.BindingContext
 import org.slf4j.LoggerFactory
@@ -34,20 +35,15 @@ import scala.util.matching.Regex
 
 object Kotlin2Cpg {
 
-  private val logger = LoggerFactory.getLogger(getClass)
-
-  private val parsingError: String = "KOTLIN2CPG_PARSING_ERROR"
-  private val jarExtension: String = ".jar"
-  private val importRegex: Regex   = ".*import([^;]*).*".r
+  private val logger               = LoggerFactory.getLogger(getClass)
+  private val JarExtension: String = ".jar"
+  private val ImportPattern: Regex = ".*import([^;]*).*".r
 
   private val defaultKotlinStdlibContentRootJarPaths = Seq(
     DefaultContentRootJarPath("jars/kotlin-stdlib-1.9.0.jar", isResource = true),
     DefaultContentRootJarPath("jars/kotlin-stdlib-common-1.9.0.jar", isResource = true),
     DefaultContentRootJarPath("jars/kotlin-stdlib-jdk8-1.9.0.jar", isResource = true)
   )
-
-  case class InputPair(content: String, fileName: String)
-  type InputProvider = () => InputPair
 
   def postProcessingPass(cpg: Cpg): Unit = {
     new KotlinTypeRecoveryPassGenerator(cpg).generate().foreach(_.createAndApply())
@@ -133,7 +129,7 @@ class Kotlin2Cpg extends X2CpgFrontend[Config] with UsesService {
     } else Seq()
   }
 
-  private def gatherJarsAtConfigClassPath(sourceDir: String, config: Config): Seq[String] = {
+  private def gatherJarsAtConfigClassPath(config: Config): Seq[String] = {
     val jarsAtConfigClassPath = findJarsIn(config.classpath)
     if (config.classpath.nonEmpty) {
       if (jarsAtConfigClassPath.nonEmpty) {
@@ -151,7 +147,7 @@ class Kotlin2Cpg extends X2CpgFrontend[Config] with UsesService {
     filesWithJavaExtension: List[String]
   ): Seq[DefaultContentRootJarPath] = {
     val stdlibJars            = if (config.withStdlibJarsInClassPath) defaultKotlinStdlibContentRootJarPaths else Seq()
-    val jarsAtConfigClassPath = gatherJarsAtConfigClassPath(sourceDir, config)
+    val jarsAtConfigClassPath = gatherJarsAtConfigClassPath(config)
     val dependenciesPaths     = gatherDependenciesPaths(sourceDir, config, filesWithJavaExtension)
     val defaultContentRootJars = stdlibJars ++
       jarsAtConfigClassPath.map { path => DefaultContentRootJarPath(path, isResource = false) } ++
@@ -186,17 +182,20 @@ class Kotlin2Cpg extends X2CpgFrontend[Config] with UsesService {
     sourceFiles
   }
 
-  private def runJavasrcInterop(
+  private def runJavaSrcInterop(
     cpg: Cpg,
-    sourceDir: String,
     config: Config,
     filesWithJavaExtension: List[String],
     kotlinAstCreatorTypes: List[String]
   ): Unit = {
     if (config.includeJavaSourceFiles && filesWithJavaExtension.nonEmpty) {
-      val javaAstCreator = JavasrcInterop.astCreationPass(config.inputPath, filesWithJavaExtension, cpg)
+      val javaAstCreator = JavaSrcInterop.astCreationPass(config.inputPath, filesWithJavaExtension, cpg)
       javaAstCreator.createAndApply()
       val javaAstCreatorTypes = javaAstCreator.global.usedTypes.keys().asScala.toList
+
+      javaAstCreator.sourceParser.cleanupDelombokOutput()
+      javaAstCreator.clearJavaParserCaches()
+
       TypeNodePass
         .withRegisteredTypes((javaAstCreatorTypes.toSet -- kotlinAstCreatorTypes.toSet).toList, cpg)
         .createAndApply()
@@ -228,23 +227,22 @@ class Kotlin2Cpg extends X2CpgFrontend[Config] with UsesService {
       new MetaDataPass(cpg, Languages.KOTLIN, config.inputPath).createAndApply()
 
       val bindingContext = createBindingContext(environment)
-      val astCreator =
-        new AstCreationPass(sourceFiles, new DefaultTypeInfoProvider(bindingContext), bindingContext, cpg)(
-          config.schemaValidation
-        )
+      val astCreator     = new AstCreationPass(sourceFiles, bindingContext, cpg)(config.schemaValidation)
       astCreator.createAndApply()
+
+      Disposer.dispose(environment.getProjectEnvironment.getParentDisposable)
 
       val kotlinAstCreatorTypes = astCreator.usedTypes()
       TypeNodePass.withRegisteredTypes(kotlinAstCreatorTypes, cpg).createAndApply()
 
-      runJavasrcInterop(cpg, sourceDir, config, filesWithJavaExtension, kotlinAstCreatorTypes)
+      runJavaSrcInterop(cpg, config, filesWithJavaExtension, kotlinAstCreatorTypes)
       new ConfigPass(configFiles, cpg).createAndApply()
       new DependenciesFromMavenCoordinatesPass(mavenCoordinates, cpg).createAndApply()
     }
   }
 
   private def importNamesForFilesAtPaths(paths: Seq[String]): Seq[String] = {
-    paths.flatMap(File(_).lines.filter(_.startsWith("import")).toSeq).map(importRegex.replaceAllIn(_, "$1").trim)
+    paths.flatMap(File(_).lines.filter(_.startsWith("import")).toSeq).map(ImportPattern.replaceAllIn(_, "$1").trim)
   }
 
   private def gatherGradleParams(config: Config) = {
@@ -288,7 +286,7 @@ class Kotlin2Cpg extends X2CpgFrontend[Config] with UsesService {
     dirs.foldLeft(Seq[String]())((acc, classpathEntry) => {
       val f = File(classpathEntry)
       val files =
-        if (f.isDirectory) f.listRecursively.filter(_.extension.getOrElse("") == jarExtension).map(_.toString)
+        if (f.isDirectory) f.listRecursively.filter(_.extension.getOrElse("") == JarExtension).map(_.toString)
         else Seq()
       acc ++ files
     })

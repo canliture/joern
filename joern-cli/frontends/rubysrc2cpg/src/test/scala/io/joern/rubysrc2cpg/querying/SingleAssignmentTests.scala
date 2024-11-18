@@ -1,10 +1,10 @@
 package io.joern.rubysrc2cpg.querying
 
+import io.joern.rubysrc2cpg.passes.Defines as RubyDefines
 import io.joern.rubysrc2cpg.testfixtures.RubyCode2CpgFixture
 import io.shiftleft.codepropertygraph.generated.nodes.{Block, Call, Identifier, Literal}
 import io.shiftleft.codepropertygraph.generated.{ControlStructureTypes, DispatchTypes, Operators}
 import io.shiftleft.semanticcpg.language.*
-import io.joern.rubysrc2cpg.passes.Defines as RubyDefines
 
 class SingleAssignmentTests extends RubyCode2CpgFixture {
 
@@ -188,7 +188,7 @@ class SingleAssignmentTests extends RubyCode2CpgFixture {
         assign1.argument(2).code shouldBe "1"
         assign1.argument(2).lineNumber shouldBe Some(4)
 
-        assign2.lineNumber shouldBe Some(5)
+        assign2.lineNumber shouldBe Some(6)
         assign2.argument(1).code shouldBe "x"
         assign2.argument(2).code shouldBe "2"
         assign2.argument(2).lineNumber shouldBe Some(6)
@@ -198,7 +198,7 @@ class SingleAssignmentTests extends RubyCode2CpgFixture {
         assign3.argument(2).code shouldBe "3"
         assign3.argument(2).lineNumber shouldBe Some(10)
 
-        assign4.lineNumber shouldBe Some(11)
+        assign4.lineNumber shouldBe Some(12)
         assign4.argument(1).code shouldBe "x"
         assign4.argument(2).code shouldBe "4"
         assign4.argument(2).lineNumber shouldBe Some(12)
@@ -304,7 +304,7 @@ class SingleAssignmentTests extends RubyCode2CpgFixture {
 
               case xs => fail(s"Expected lhs and rhs, got ${xs.code.mkString(";")}]")
             }
-          case xs => fail(s"Expected six assignemnts, got [${xs.code.mkString(";")}]")
+          case xs => fail(s"Expected six assignments, got [${xs.code.mkString(";")}]")
         }
       case xs => fail(s"Expected three lambdas, got ${xs.size} lambdas instead")
     }
@@ -464,7 +464,7 @@ class SingleAssignmentTests extends RubyCode2CpgFixture {
       case assignmentCall :: Nil =>
         val List(lhs: Call, rhs) = assignmentCall.argument.l: @unchecked
 
-        lhs.code shouldBe "A.b"
+        lhs.code shouldBe "A::b"
         lhs.methodFullName shouldBe Operators.fieldAccess
 
         rhs.code shouldBe "1"
@@ -482,7 +482,7 @@ class SingleAssignmentTests extends RubyCode2CpgFixture {
         assignmentCall.code shouldBe "A::b *= 1"
         val List(lhs: Call, rhs) = assignmentCall.argument.l: @unchecked
 
-        lhs.code shouldBe "A.b"
+        lhs.code shouldBe "A::b"
         lhs.methodFullName shouldBe Operators.fieldAccess
 
         rhs.code shouldBe "1"
@@ -503,6 +503,57 @@ class SingleAssignmentTests extends RubyCode2CpgFixture {
         blockArg.code shouldBe "block"
 
       case xs => fail(s"Expected two args, found [${xs.code.mkString(",")}]")
+    }
+  }
+
+  "bitwise AND/OR assignments should parse correctly" in {
+    val cpg = code("""
+        |x = 1
+        |x &= 0
+        |x |= 1
+        |""".stripMargin)
+
+    inside(cpg.assignment.l) { case _ :: and :: or :: Nil =>
+      and.name shouldBe Operators.assignmentAnd
+      and.code shouldBe "x &= 0"
+
+      or.name shouldBe Operators.assignmentOr
+      or.code shouldBe "x |= 1"
+    }
+  }
+
+  "shift left/right assignments should parse correctly" in {
+    val cpg = code("""
+        |x = 1
+        |x >>= 1
+        |x <<= 2
+        |""".stripMargin)
+
+    inside(cpg.assignment.l) { case _ :: sr :: sl :: Nil =>
+      sr.name shouldBe Operators.assignmentArithmeticShiftRight
+      sr.code shouldBe "x >>= 1"
+
+      sl.name shouldBe Operators.assignmentShiftLeft
+      sl.code shouldBe "x <<= 2"
+    }
+  }
+
+  "global variable assignment" in {
+    val cpg = code("""
+        |$alfred = "123"
+        |""".stripMargin)
+
+    inside(cpg.call.name(Operators.assignment).l) {
+      case alfredAssign :: Nil =>
+        alfredAssign.code shouldBe "$alfred = \"123\""
+
+        val List(lhs: Call, rhs: Literal) = alfredAssign.argument.l: @unchecked
+
+        lhs.methodFullName shouldBe Operators.fieldAccess
+        lhs.code shouldBe "self.$alfred"
+
+        rhs.code shouldBe "\"123\""
+      case xs => fail(s"Expected one assignment call, got [${xs.code.mkString(",")}]")
     }
   }
 }

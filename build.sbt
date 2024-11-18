@@ -1,8 +1,8 @@
 name                     := "joern"
 ThisBuild / organization := "io.joern"
-ThisBuild / scalaVersion := "3.4.2"
+ThisBuild / scalaVersion := "3.4.3"
 
-val cpgVersion = "1.7.11"
+val cpgVersion = "1.7.13"
 
 lazy val joerncli          = Projects.joerncli
 lazy val querydb           = Projects.querydb
@@ -74,7 +74,8 @@ Global / onChangedBuildSource := ReloadOnSourceChanges
 
 // publishing info for sonatype / maven central
 ThisBuild / publishTo  := sonatypePublishToBundle.value
-sonatypeCredentialHost := "s01.oss.sonatype.org"
+ThisBuild / sonatypeCredentialHost := xerial.sbt.Sonatype.sonatypeCentralHost
+
 ThisBuild / scmInfo    := Some(ScmInfo(url("https://github.com/joernio/joern"), "scm:git@github.com:joernio/joern.git"))
 ThisBuild / homepage   := Some(url("https://joern.io/"))
 ThisBuild / licenses   := List("Apache-2.0" -> url("http://www.apache.org/licenses/LICENSE-2.0"))
